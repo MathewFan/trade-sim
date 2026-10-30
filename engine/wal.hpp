@@ -1,71 +1,118 @@
 #pragma once
-#include <cstdio>
-#include <cstdint>
-#include <string>
-#include <vector>
-#include <array>
-#include <mutex>
-#include "sha256.hpp"
 #include "book.hpp"
+#include "sha256.hpp"
+#include <cerrno>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <limits>
+#include <stdexcept>
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 
-enum class RecType : uint8_t { New=1, Cancel=2, Print=3 };
-
-struct WalWriter {
-    std::string path;
-    std::FILE*  fp{nullptr};
-    std::array<uint8_t,32> prev_hash{}; // starts at zero
-    std::mutex mtx; // serialize writes
-
-    explicit WalWriter(const std::string& p): path(p){
-        fp = std::fopen(path.c_str(), "ab");
+// Version 2: immutable input commands, never mutated residual quantities.
+enum class RecType : uint8_t { New=1, Cancel=2 };
+struct WalRecord { RecType type{RecType::New}; uint64_t seq{},ts_ns{}; Order order{}; uint64_t cancel_id{}; };
+namespace wal_codec {
+using Bytes=std::vector<uint8_t>;
+inline void u32(Bytes& out,uint32_t value) {for(int shift=24;shift>=0;shift-=8) out.push_back(static_cast<uint8_t>(value>>shift));}
+inline void u64(Bytes& out,uint64_t value) {for(int shift=56;shift>=0;shift-=8) out.push_back(static_cast<uint8_t>(value>>shift));}
+struct Reader {
+    const Bytes& bytes;size_t offset{};
+    uint64_t integer(size_t length) {
+        if(length>bytes.size()-offset) throw std::runtime_error("truncated WAL payload");
+        uint64_t value=0;for(size_t i=0;i<length;i++) value=(value<<8)|bytes[offset++];return value;
     }
-    ~WalWriter(){ if(fp) std::fclose(fp); }
-
-    inline void write_u8(uint8_t v){ std::fwrite(&v,1,1,fp); }
-    inline void write_u32(uint32_t v){ std::fwrite(&v,4,1,fp); }
-    inline void write_u64(uint64_t v){ std::fwrite(&v,8,1,fp); }
-    inline void write_bytes(const void* p, size_t n){ std::fwrite(p,1,n,fp); }
-
-    // serialize record into a buffer (excluding post_hash), compute hash chaining, then append hash and flush buffer.
-    void append_record(RecType typ, uint64_t seq, uint64_t ts_ns,
-                       const std::vector<uint8_t>& raw_msg,
-                       const std::vector<Trade>& trades){
-        std::lock_guard<std::mutex> lk(mtx);
-        // build the byte buffer for hashing + writing
-        std::vector<uint8_t> buf;
-        buf.reserve(1+8+8+4+raw_msg.size()+4 + trades.size()* (8+8+8+8));
-
-        auto put_u8=[&](uint8_t v){ buf.push_back(v); };
-        auto put_u32=[&](uint32_t v){ for(int i=3;i>=0;--i) buf.push_back( (v>>(8*i))&0xFF ); };
-        auto put_u64=[&](uint64_t v){ for(int i=7;i>=0;--i) buf.push_back( (v>>(8*i))&0xFF ); };
-
-        put_u8((uint8_t)typ);
-        put_u64(seq);
-        put_u64(ts_ns);
-        put_u32((uint32_t)raw_msg.size());
-        buf.insert(buf.end(), raw_msg.begin(), raw_msg.end());
-        put_u32((uint32_t)trades.size());
-        for (auto& t : trades){
-            put_u64(t.resting_id.v);
-            put_u64(t.incoming_id.v);
-            put_u64((uint64_t)t.px);
-            put_u64((uint64_t)t.qty);
-        }
-
-        // H_i = SHA256(prev_hash || buf)
-        std::vector<uint8_t> hasher_input;
-        hasher_input.reserve(prev_hash.size() + buf.size());
-        hasher_input.insert(hasher_input.end(), prev_hash.begin(), prev_hash.end());
-        hasher_input.insert(hasher_input.end(), buf.begin(), buf.end());
-        auto h = SHA256::hash(hasher_input);
-
-        // write: buf + post_hash
-        std::fwrite(buf.data(), 1, buf.size(), fp);
-        std::fwrite(h.data(), 1, h.size(), fp);
-        std::fflush(fp);
-
-        prev_hash = h;
+    long long signed_positive() {const auto value=integer(8);if(value>static_cast<uint64_t>(std::numeric_limits<long long>::max())) throw std::runtime_error("WAL integer outside signed range");return static_cast<long long>(value);}
+};
+inline Bytes header(uint32_t shards,uint32_t index) {
+    const std::string magic="TSWAL002";Bytes out(magic.begin(),magic.end());u32(out,shards);u32(out,index);return out;
+}
+inline Bytes encode(const WalRecord& record) {
+    Bytes out;out.push_back(static_cast<uint8_t>(record.type));u64(out,record.seq);u64(out,record.ts_ns);
+    if(record.type==RecType::New) {
+        const auto& order=record.order;validate_order(order);u64(out,order.id.v);
+        out.push_back(static_cast<uint8_t>(order.sym.size()));out.insert(out.end(),order.sym.begin(),order.sym.end());
+        out.push_back(static_cast<uint8_t>(order.side));u64(out,order.px);u64(out,order.qty);out.push_back(static_cast<uint8_t>(order.tif));
+    }else if(record.type==RecType::Cancel && record.cancel_id) u64(out,record.cancel_id);
+    else throw std::invalid_argument("invalid WAL record type or cancel ID");
+    return out;
+}
+inline WalRecord decode(const Bytes& bytes) {
+    Reader input{bytes};WalRecord result;result.type=static_cast<RecType>(input.integer(1));result.seq=input.integer(8);result.ts_ns=input.integer(8);
+    if(result.ts_ns>static_cast<uint64_t>(std::numeric_limits<long long>::max())) throw std::runtime_error("invalid WAL timestamp");
+    if(result.type==RecType::New) {
+        auto& order=result.order;order.id.v=input.integer(8);const auto size=input.integer(1);
+        if(!size || size>16 || size>bytes.size()-input.offset) throw std::runtime_error("invalid WAL symbol length");
+        order.sym.assign(bytes.begin()+input.offset,bytes.begin()+input.offset+size);input.offset+=size;
+        order.side=static_cast<Side>(input.integer(1));order.px=input.signed_positive();order.qty=input.signed_positive();order.tif=static_cast<Tif>(input.integer(1));
+        order.ts_ns=static_cast<long long>(result.ts_ns);validate_order(order);
+    }else if(result.type==RecType::Cancel) {result.cancel_id=input.integer(8);if(!result.cancel_id) throw std::runtime_error("zero WAL cancel ID");}
+    else throw std::runtime_error("unknown WAL record type");
+    if(input.offset!=bytes.size()) throw std::runtime_error("unexpected WAL trailing payload");return result;
+}
+inline std::array<uint8_t,32> chain(const std::array<uint8_t,32>& previous,const Bytes& frame) {
+    SHA256 hash;hash.update(previous.data(),previous.size());hash.update(frame);return hash.digest();
+}
+inline Bytes read_exact(std::ifstream& input,size_t size) {
+    Bytes out(size);if(!input.read(reinterpret_cast<char*>(out.data()),static_cast<std::streamsize>(size))) throw std::runtime_error("truncated WAL: no automatic tail repair");return out;
+}
+}
+struct WalSummary { uint32_t shards{},index{};uint64_t records{};std::array<uint8_t,32> tip{}; };
+inline WalSummary scan_wal(const std::string& path,const std::function<void(const WalRecord&)>& visit={}) {
+    using namespace wal_codec;
+    std::ifstream input(path,std::ios::binary);if(!input) throw std::runtime_error("cannot open WAL "+path);
+    const auto head=read_exact(input,16);
+    if(std::string(head.begin(),head.begin()+8)!="TSWAL002") throw std::runtime_error("unsupported WAL version (legacy logs are not replayable)");
+    Reader reader{head,8};WalSummary summary;summary.shards=static_cast<uint32_t>(reader.integer(4));summary.index=static_cast<uint32_t>(reader.integer(4));
+    if(!summary.shards||summary.shards>64||summary.index>=summary.shards) throw std::runtime_error("invalid WAL shard topology");
+    summary.tip=SHA256::hash(head);
+    while(input.peek()!=std::char_traits<char>::eof()) {
+        auto frame=read_exact(input,4);Reader length_reader{frame};const auto length=length_reader.integer(4);
+        if(length<25 || length>128) throw std::runtime_error("WAL frame length outside 25..128");
+        const auto body=read_exact(input,static_cast<size_t>(length));frame.insert(frame.end(),body.begin(),body.end());
+        const auto post=read_exact(input,32);const auto expected=chain(summary.tip,frame);
+        if(!std::equal(expected.begin(),expected.end(),post.begin())) throw std::runtime_error("WAL hash mismatch at record "+std::to_string(summary.records+1));
+        const auto record=decode(body);
+        if(record.seq!=summary.records+1) throw std::runtime_error("non-contiguous WAL sequence");
+        ++summary.records;summary.tip=expected;if(visit) visit(record);
     }
-
-    std::string current_hex_root() const { return hex32(prev_hash); }
+    if(input.bad()) throw std::runtime_error("WAL read failed");return summary;
+}
+class WalWriter {
+    int fd{-1};bool sync;
+    void write_all(const wal_codec::Bytes& bytes) {
+        size_t offset=0;
+        while(offset<bytes.size()) {const auto n=::write(fd,bytes.data()+offset,bytes.size()-offset);if(n<0&&errno==EINTR) continue;if(n<=0) throw std::runtime_error("WAL write failed");offset+=static_cast<size_t>(n);}
+    }
+    void synchronize() {if(sync && ::fsync(fd)!=0) throw std::runtime_error("WAL fsync failed");}
+public:
+    std::string path;std::array<uint8_t,32> prev_hash{};uint64_t sequence{};
+    WalWriter(const std::string& file,uint32_t count,uint32_t index,bool durable):sync(durable),path(file) {
+        fd=::open(path.c_str(),O_RDWR|O_CREAT,0600);if(fd<0) throw std::runtime_error("cannot create/open WAL "+path);
+        try {
+            if(::flock(fd,LOCK_EX|LOCK_NB)!=0) throw std::runtime_error("WAL already has a writer");
+            struct stat info{};if(::fstat(fd,&info)!=0) throw std::runtime_error("cannot stat WAL");
+            if(info.st_size==0) {
+                const auto head=wal_codec::header(count,index);write_all(head);synchronize();
+                // Persist newly-created directory entries as well as file contents.
+                if(sync) {const auto parent=std::filesystem::path(path).parent_path();const int dir=::open((parent.empty()?".":parent.string()).c_str(),O_RDONLY);if(dir<0) throw std::runtime_error("cannot open WAL directory");const int rc=::fsync(dir);::close(dir);if(rc!=0) throw std::runtime_error("WAL directory fsync failed");}
+            }
+            const auto summary=scan_wal(path);
+            if(summary.shards!=count || summary.index!=index) throw std::runtime_error("WAL shard topology mismatch");
+            prev_hash=summary.tip;sequence=summary.records;
+            if(::lseek(fd,0,SEEK_END)<0) throw std::runtime_error("cannot seek WAL");
+        }catch(...) {::close(fd);fd=-1;throw;}
+    }
+    WalWriter(const WalWriter&)=delete;WalWriter& operator=(const WalWriter&)=delete;
+    ~WalWriter() {if(fd>=0) ::close(fd);}
+    void append(const WalRecord& record) {
+        if(record.seq!=sequence+1) throw std::runtime_error("WAL append sequence mismatch");
+        const auto body=wal_codec::encode(record);wal_codec::Bytes frame;wal_codec::u32(frame,static_cast<uint32_t>(body.size()));frame.insert(frame.end(),body.begin(),body.end());
+        const auto hash=wal_codec::chain(prev_hash,frame);frame.insert(frame.end(),hash.begin(),hash.end());
+        write_all(frame);synchronize();prev_hash=hash;sequence=record.seq;
+    }
 };

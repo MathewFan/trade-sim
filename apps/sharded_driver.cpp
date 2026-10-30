@@ -3,7 +3,7 @@
 #include <sstream>
 int main(int argc,char** argv) {
     try {
-        Engine engine(argc>1?std::stoul(argv[1]):4);engine.set_event_sink([](const std::string& event){std::cout<<event<<'\n';});engine.start();
+        Engine engine(argc>1?std::stoul(argv[1]):4,EngineOptions{argc>2?argv[2]:"",true});engine.set_event_sink([](const std::string& event){std::cout<<event<<'\n';});engine.start();
         std::string line;
         while(std::getline(std::cin,line)) {
             std::istringstream input(line);std::string command;input>>command;

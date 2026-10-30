@@ -33,7 +33,22 @@ void Engine::start() {
     started=true;
     if(!options.wal_directory.empty()) {
         std::filesystem::create_directories(options.wal_directory);
-        for(size_t i=0;i<nshards;++i) shards[i]->wal=std::make_unique<WalWriter>(options.wal_directory+"/shard"+std::to_string(i)+".bin");
+        for(size_t i=0;i<nshards;++i) {
+            auto& shard=*shards[i];
+            shard.wal=std::make_unique<WalWriter>(options.wal_directory+"/shard"+std::to_string(i)+".wal",static_cast<uint32_t>(nshards),static_cast<uint32_t>(i),options.sync_wal);
+            scan_wal(shard.wal->path,[&](const WalRecord& record) {
+                Msg msg;msg.type=record.type==RecType::New?MsgType::New:MsgType::Cancel;
+                msg.order=record.order;msg.cancel_id=record.cancel_id;
+                const auto id=msg.type==MsgType::New?msg.order.id.v:msg.cancel_id;
+                if(id%nshards!=i || (msg.type==MsgType::New && shard_of(msg.order.sym)!=i)) throw std::runtime_error("WAL order routed to wrong shard");
+                if(msg.type==MsgType::New) {
+                    if(id/nshards>=std::numeric_limits<uint64_t>::max()/nshards-1) throw std::runtime_error("WAL order ID exhausted");
+                    next_id.store(std::max(next_id.load(),id/nshards+1));
+                }
+                apply(shard,msg,true);
+            });
+            shard.journal_tip=shard.wal->prev_hash;
+        }
     }
     try {
         for(auto& shard:shards) {shard->running=true;auto* ptr=shard.get();shard->thread=std::thread([this,ptr]{worker(*ptr);});}
@@ -115,7 +130,20 @@ void Engine::apply(ShardWorker& shard,Msg& msg,bool recovering) {
         if(msg.type==MsgType::Print) emit("{\"event\":\"state_root\",\"sym\":\""+msg.print_sym+"\",\"root\":\""+value.state_hash+"\",\"journal_tip\":\""+value.journal_tip+"\"}");
         return;
     }
-    ++shard.sequence;
+    if(msg.type==MsgType::New) {
+        validate_order(msg.order);
+        const auto found=shard.books.find(msg.order.sym);
+        if(found!=shard.books.end() && (found->second.by_id.count(msg.order.id.v)||found->second.by_id.size()>=1000000))
+            throw std::runtime_error("duplicate active ID or active-order capacity exceeded");
+    }
+    const auto sequence=shard.sequence+1;
+    if(shard.wal && !recovering) {
+        WalRecord record;record.type=msg.type==MsgType::New?RecType::New:RecType::Cancel;
+        record.seq=sequence;record.ts_ns=static_cast<uint64_t>(msg.order.ts_ns);record.order=msg.order;record.cancel_id=msg.cancel_id;
+        shard.wal->append(record); // Successful append+optional fsync BEFORE any book mutation.
+        shard.journal_tip=shard.wal->prev_hash;
+    }
+    shard.sequence=sequence;
     ExecutionReport report; report.sequence=shard.sequence;
     const auto original=msg.order;
     if(msg.type==MsgType::New) {
@@ -124,15 +152,11 @@ void Engine::apply(ShardWorker& shard,Msg& msg,bool recovering) {
         report.remaining=msg.order.qty;report.resting=book.by_id.count(report.id)>0;
         for(const auto& trade:report.trades) if(!book.by_id.count(trade.resting_id.v)) shard.active_symbols.erase(trade.resting_id.v);
         if(report.resting) shard.active_symbols.emplace(report.id,msg.order.sym);
-        if(shard.wal && !recovering) {
-            const auto raw="N "+std::to_string(original.id.v)+" "+original.sym+" "+std::to_string(static_cast<int>(original.side))+" "+std::to_string(original.px)+" "+std::to_string(original.qty)+" "+std::to_string(static_cast<int>(original.tif));
-            shard.wal->append_record(RecType::New,shard.sequence,original.ts_ns,{raw.begin(),raw.end()},report.trades);shard.journal_tip=shard.wal->prev_hash;
-        }
         if(!recovering) for(const auto& trade:report.trades) emit("{\"event\":\"trade\",\"seq\":"+std::to_string(trade.seq)+",\"sym\":\""+original.sym+"\",\"px\":"+std::to_string(trade.px)+",\"qty\":"+std::to_string(trade.qty)+"}");
     }else {
         report.id=msg.cancel_id;auto found=shard.active_symbols.find(msg.cancel_id);
         if(found!=shard.active_symbols.end()) {report.cancelled=cancel(shard.books.at(found->second),msg.cancel_id);shard.active_symbols.erase(found);}
-        if(shard.wal && !recovering) {const auto raw="C "+std::to_string(msg.cancel_id);shard.wal->append_record(RecType::Cancel,shard.sequence,msg.order.ts_ns,{raw.begin(),raw.end()},{});shard.journal_tip=shard.wal->prev_hash;}
+
     }
     if(msg.report) msg.report->set_value(std::move(report));
 }
