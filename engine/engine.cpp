@@ -33,6 +33,9 @@ void Engine::start() {
     started=true;
     if(!options.wal_directory.empty()) {
         std::filesystem::create_directories(options.wal_directory);
+        size_t existing=0;
+        for(size_t i=0;i<nshards;i++) existing+=std::filesystem::exists(options.wal_directory+"/shard"+std::to_string(i)+".wal");
+        if(existing && existing!=nshards) throw std::runtime_error("incomplete WAL shard set; refusing partial recovery");
         for(size_t i=0;i<nshards;++i) {
             auto& shard=*shards[i];
             shard.wal=std::make_unique<WalWriter>(options.wal_directory+"/shard"+std::to_string(i)+".wal",static_cast<uint32_t>(nshards),static_cast<uint32_t>(i),options.sync_wal);
@@ -152,7 +155,7 @@ void Engine::apply(ShardWorker& shard,Msg& msg,bool recovering) {
         report.remaining=msg.order.qty;report.resting=book.by_id.count(report.id)>0;
         for(const auto& trade:report.trades) if(!book.by_id.count(trade.resting_id.v)) shard.active_symbols.erase(trade.resting_id.v);
         if(report.resting) shard.active_symbols.emplace(report.id,msg.order.sym);
-        if(!recovering) for(const auto& trade:report.trades) emit("{\"event\":\"trade\",\"seq\":"+std::to_string(trade.seq)+",\"sym\":\""+original.sym+"\",\"px\":"+std::to_string(trade.px)+",\"qty\":"+std::to_string(trade.qty)+"}");
+        if(!recovering) for(const auto& trade:report.trades) emit("{\"event\":\"trade\",\"seq\":"+std::to_string(trade.seq)+",\"shard\":"+std::to_string(original.id.v%nshards)+",\"resting_id\":"+std::to_string(trade.resting_id.v)+",\"incoming_id\":"+std::to_string(trade.incoming_id.v)+",\"sym\":\""+original.sym+"\",\"px\":"+std::to_string(trade.px)+",\"qty\":"+std::to_string(trade.qty)+"}");
     }else {
         report.id=msg.cancel_id;auto found=shard.active_symbols.find(msg.cancel_id);
         if(found!=shard.active_symbols.end()) {report.cancelled=cancel(shard.books.at(found->second),msg.cancel_id);shard.active_symbols.erase(found);}

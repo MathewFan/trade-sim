@@ -1,6 +1,7 @@
 #pragma once
 #include "book.hpp"
 #include "sha256.hpp"
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <filesystem>

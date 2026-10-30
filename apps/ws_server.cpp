@@ -1,237 +1,131 @@
-#include <algorithm>
-#include <array>
-#include <condition_variable>
-#include <cstring>
+#include "engine.hpp"
+#include "protocol.hpp"
+#include "websocket.hpp"
+#include <arpa/inet.h>
+#include <csignal>
 #include <deque>
 #include <iostream>
-#include <mutex>
-#include <string>
-#include <thread>
-#include <vector>
-#include <sys/types.h>
-#include <sys/socket.h>
 #include <netinet/in.h>
-#include <unistd.h>
-#include <arpa/inet.h>
+#include <poll.h>
+#include <sstream>
+#include <sys/socket.h>
 #include <fcntl.h>
-
-#include "../engine/engine.hpp"
-#include "../engine/sha256.hpp" // we reuse base64 from here? (we'll implement a tiny base64 here)
-
-// --- tiny base64 encoder (RFC4648, no line breaks) ---
-static std::string b64(const uint8_t* data, size_t len){
-    static const char* T="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    std::string out; out.reserve((len+2)/3*4);
-    size_t i=0; while(i+3<=len){
-        uint32_t v=(data[i]<<16)|(data[i+1]<<8)|data[i+2];
-        out.push_back(T[(v>>18)&63]); out.push_back(T[(v>>12)&63]);
-        out.push_back(T[(v>>6)&63]);  out.push_back(T[v&63]);
-        i+=3;
-    }
-    if(i+1==len){
-        uint32_t v=(data[i]<<16);
-        out.push_back(T[(v>>18)&63]); out.push_back(T[(v>>12)&63]);
-        out.push_back('=' ); out.push_back('=');
-    } else if(i+2==len){
-        uint32_t v=(data[i]<<16)|(data[i+1]<<8);
-        out.push_back(T[(v>>18)&63]); out.push_back(T[(v>>12)&63]);
-        out.push_back(T[(v>>6)&63]);  out.push_back('=');
-    }
-    return out;
-}
-
-// SHA1 (minimal, for WS accept key)
-struct SHA1 {
-    uint32_t h[5]; uint64_t bits=0; uint8_t buf[64]; size_t fill=0;
-    static inline uint32_t rol(uint32_t v,int n){ return (v<<n)|(v>>(32-n)); }
-    void init(){ h[0]=0x67452301; h[1]=0xEFCDAB89; h[2]=0x98BADCFE; h[3]=0x10325476; h[4]=0xC3D2E1F0; bits=0; fill=0; }
-    void tr(const uint8_t B[64]){
-        uint32_t w[80];
-        for(int i=0;i<16;++i) w[i]=(B[4*i]<<24)|(B[4*i+1]<<16)|(B[4*i+2]<<8)|B[4*i+3];
-        for(int i=16;i<80;++i) w[i]=rol(w[i-3]^w[i-8]^w[i-14]^w[i-16],1);
-        uint32_t a=h[0],b=h[1],c=h[2],d=h[3],e=h[4];
-        for(int i=0;i<80;++i){
-            uint32_t f,k;
-            if(i<20){ f=(b&c)|((~b)&d); k=0x5A827999; }
-            else if(i<40){ f=b^c^d; k=0x6ED9EBA1; }
-            else if(i<60){ f=(b&c)|(b&d)|(c&d); k=0x8F1BBCDC; }
-            else { f=b^c^d; k=0xCA62C1D6; }
-            uint32_t t=rol(a,5)+f+e+k+w[i];
-            e=d; d=c; c=rol(b,30); b=a; a=t;
-        }
-        h[0]+=a; h[1]+=b; h[2]+=c; h[3]+=d; h[4]+=e;
-    }
-    void update(const uint8_t* p,size_t n){
-        for(size_t i=0;i<n;++i){
-            buf[fill++]=p[i];
-            if(fill==64){ tr(buf); bits+=512; fill=0; }
-        }
-    }
-    std::array<uint8_t,20> finish(){
-        uint64_t total=bits+fill*8;
-        buf[fill++]=0x80;
-        if(fill>56){ while(fill<64) buf[fill++]=0; tr(buf); fill=0; }
-        while(fill<56) buf[fill++]=0;
-        for(int i=7;i>=0;--i) buf[fill++]=(total>>(8*i))&0xff;
-        tr(buf);
-        std::array<uint8_t,20> out{};
-        for(int i=0;i<5;++i){ out[4*i+0]=(h[i]>>24)&0xff; out[4*i+1]=(h[i]>>16)&0xff; out[4*i+2]=(h[i]>>8)&0xff; out[4*i+3]=h[i]&0xff; }
-        return out;
-    }
-    static std::array<uint8_t,20> hash(const std::string& s){ SHA1 sh; sh.init(); sh.update((const uint8_t*)s.data(), s.size()); return sh.finish(); }
+#include <unistd.h>
+namespace {
+volatile std::sig_atomic_t stopped=0;
+void signal_stop(int){stopped=1;}
+std::string lower(std::string value){for(auto& ch:value)ch=static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));return value;}
+std::string trim(std::string value){const auto begin=value.find_first_not_of(" \t\r");if(begin==std::string::npos)return {};return value.substr(begin,value.find_last_not_of(" \t\r")-begin+1);}
+bool token(const std::string& value,const std::string& target){std::istringstream input(lower(value));std::string item;while(std::getline(input,item,','))if(trim(item)==target)return true;return false;}
+struct Pending {char type;std::future<ExecutionReport> execution;std::future<Snapshot> snapshot;};
+struct Client {
+    int fd;bool handshake{},dead{};std::string input,output;size_t sent{};
+    std::deque<Pending> pending;std::chrono::steady_clock::time_point connected=std::chrono::steady_clock::now();
+    explicit Client(int socket):fd(socket){}
 };
-
-// Minimal WebSocket frame send (text only, <= 125 bytes per chunk; will chunk if larger)
-static bool ws_send_text(int fd, const std::string& msg){
-    size_t i=0;
-    while(i<msg.size()){
-        size_t chunk = std::min<size_t>(125, msg.size()-i);
-        uint8_t hdr[2]; hdr[0]=0x81; hdr[1]=uint8_t(chunk); // FIN+text, no mask (server->client)
-        if(::send(fd, hdr, 2, 0)<=0) return false;
-        if(::send(fd, msg.data()+i, chunk, 0)<=0) return false;
-        i+=chunk;
+void queue(Client& client,const std::string& payload,uint8_t opcode=1) {
+    if(client.output.size()-client.sent+payload.size()>262144) {client.dead=true;return;}
+    if(client.sent){client.output.erase(0,client.sent);client.sent=0;}
+    client.output+=websocket::frame(payload,opcode);
+}
+void invalid(Client& client){queue(client,"{\"event\":\"error\",\"message\":\"Invalid command or engine unavailable\"}");}
+void upgrade(Client& client){
+    const auto end=client.input.find("\r\n\r\n");if(end==std::string::npos)return;
+    std::istringstream request(client.input.substr(0,end));std::string line;std::getline(request,line);
+    if(trim(line)!="GET /ws HTTP/1.1")throw std::runtime_error("unsupported request path");
+    std::map<std::string,std::string> headers;
+    while(std::getline(request,line)){const auto colon=line.find(':');if(colon==std::string::npos)throw std::runtime_error("bad HTTP header");if(!headers.emplace(lower(trim(line.substr(0,colon))),trim(line.substr(colon+1))).second)throw std::runtime_error("duplicate HTTP header");}
+    const auto key=headers["sec-websocket-key"];
+    if(lower(headers["upgrade"])!="websocket"||!token(headers["connection"],"upgrade")||headers["sec-websocket-version"]!="13"||key.size()!=24||key.substr(22)!="==")throw std::runtime_error("invalid WebSocket handshake");
+    for(size_t i=0;i<22;i++)if(!(std::isalnum(static_cast<unsigned char>(key[i]))||key[i]=='+'||key[i]=='/'))throw std::runtime_error("invalid WebSocket key");
+    client.output="HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: "+websocket::accept_key(key)+"\r\n\r\n";
+    client.input.erase(0,end+4);client.handshake=true;
+}
+std::string depth_json(const Snapshot& value) {
+    auto levels=[](const auto& side){std::string out="[";for(size_t i=0;i<std::min<size_t>(10,side.size());i++){if(i)out+=",";out+="["+std::to_string(side[i].px)+","+std::to_string(side[i].qty)+","+std::to_string(side[i].orders)+"]";}return out+"]";};
+    return "{\"event\":\"depth\",\"sym\":\""+value.sym+"\",\"seq\":"+std::to_string(value.sequence)+",\"active_orders\":"+std::to_string(value.active_orders)+",\"bids\":"+levels(value.bids)+",\"asks\":"+levels(value.asks)+",\"state_hash\":\""+value.state_hash+"\",\"journal_tip\":\""+value.journal_tip+"\"}";
+}
+void command(Client& client,Engine& engine,const std::string& payload) {
+    try {
+        if(client.pending.size()>=128)throw std::runtime_error("too many pending commands");
+        const auto cmd=protocol::command(payload);Pending pending;pending.type=cmd.type;
+        if(cmd.type=='N')pending.execution=engine.submit(cmd.sym,cmd.side,cmd.px,cmd.qty,cmd.tif).completion;
+        else if(cmd.type=='C')pending.execution=engine.cancel_async(cmd.id);
+        else pending.snapshot=engine.snapshot(cmd.sym);
+        client.pending.push_back(std::move(pending));
+    }catch(const std::exception&){invalid(client);}
+}
+void completions(Client& client) {
+    while(!client.pending.empty()) {
+        auto& pending=client.pending.front();
+        const bool ready=pending.type=='P'?pending.snapshot.wait_for(std::chrono::seconds(0))==std::future_status::ready:pending.execution.wait_for(std::chrono::seconds(0))==std::future_status::ready;
+        if(!ready)break;
+        try {
+            if(pending.type=='P')queue(client,depth_json(pending.snapshot.get()));
+            else {const auto report=pending.execution.get();queue(client,"{\"event\":\"ack\",\"action\":\""+std::string(1,pending.type)+"\",\"id\":"+std::to_string(report.id)+",\"seq\":"+std::to_string(report.sequence)+",\"remaining\":"+std::to_string(report.remaining)+",\"resting\":"+(report.resting?"true":"false")+",\"cancelled\":"+(report.cancelled?"true":"false")+"}");}
+        }catch(const std::exception&){invalid(client);}
+        client.pending.pop_front();
     }
-    return true;
 }
-
-// Read a single WS text message (no fragmentation) and return payload string; returns empty string on close/error
-static std::string ws_read_text(int fd){
-    uint8_t h[2]; ssize_t n=recv(fd,h,2,MSG_WAITALL); if(n!=2) return {};
-    bool fin = (h[0] & 0x80)!=0; (void)fin;
-    uint8_t opcode = h[0] & 0x0F; if(opcode==0x8) return {}; // close
-    bool masked = (h[1] & 0x80)!=0; if(!masked) return {};
-    uint64_t len = h[1] & 0x7F;
-    if(len==126){ uint8_t ext[2]; if(recv(fd,ext,2,MSG_WAITALL)!=2) return {}; len=(ext[0]<<8)|ext[1]; }
-    else if(len==127){ uint8_t ext[8]; if(recv(fd,ext,8,MSG_WAITALL)!=8) return {}; len=0; for(int i=0;i<8;++i) len=(len<<8)|ext[i]; }
-    uint8_t mask[4]; if(recv(fd,mask,4,MSG_WAITALL)!=4) return {};
-    std::string payload; payload.resize(len);
-    if(len && recv(fd,payload.data(),len,MSG_WAITALL)!=(ssize_t)len) return {};
-    for(size_t i=0;i<len;++i) payload[i]^=mask[i&3];
-    return payload;
 }
-
-// Very tiny line-based JSON parser for our 3 commands (we avoid pulling a JSON lib)
-static inline std::string get_str(const std::string& s, const char* key){
-    auto k = std::string("\"")+key+"\"";
-    auto p = s.find(k); if(p==std::string::npos) return {};
-    p = s.find(':',p); if(p==std::string::npos) return {};
-    p = s.find_first_of("\"", p+1); if(p==std::string::npos) return {};
-    auto q = s.find('"', p+1); if(q==std::string::npos) return {};
-    return s.substr(p+1, q-(p+1));
-}
-static inline long long get_num(const std::string& s, const char* key, long long def=0){
-    auto k = std::string("\"")+key+"\"";
-    auto p = s.find(k); if(p==std::string::npos) return def;
-    p = s.find(':',p); if(p==std::string::npos) return def;
-    auto q = s.find_first_of(",} \n\r", p+1);
-    auto num = s.substr(p+1, (q==std::string::npos? s.size():q) - (p+1));
-    try { return std::stoll(num); } catch(...) { return def; }
-}
-
-int main(int argc, char** argv){
-    int port = 9001;
-    size_t nshards = 4;
-    if(argc>=2) port = std::stoi(argv[1]);
-    if(argc>=3) nshards = std::max<size_t>(1, std::stoul(argv[2]));
-
-    Engine eng(nshards);
-    // --- simple event queue for broadcasting from engine thread(s) to ws thread(s)
-    std::mutex q_mtx; std::condition_variable q_cv; std::deque<std::string> q;
-    eng.set_event_sink([&](const std::string& ev){
-        std::lock_guard<std::mutex> lk(q_mtx);
-        q.push_back(ev);
-        q_cv.notify_all();
-    });
-    eng.start();
-
-    // --- socket setup
-    int srv = ::socket(AF_INET, SOCK_STREAM, 0);
-    int one=1; setsockopt(srv,SOL_SOCKET,SO_REUSEADDR,&one,sizeof(one));
-    sockaddr_in addr{}; addr.sin_family=AF_INET; addr.sin_addr.s_addr=htonl(INADDR_LOOPBACK); addr.sin_port=htons(port);
-    if(::bind(srv,(sockaddr*)&addr,sizeof(addr))<0){ perror("bind"); return 1; }
-    if(::listen(srv, 8)<0){ perror("listen"); return 1; }
-    std::cout<<"WS listening on ws://127.0.0.1:"<<port<<"/ws\n";
-
-    std::vector<int> clients; std::mutex c_mtx;
-
-    // broadcaster thread
-    std::thread broadcaster([&](){
-        while(true){
-            std::unique_lock<std::mutex> lk(q_mtx);
-            q_cv.wait(lk, [&]{ return !q.empty(); });
-            auto msg = std::move(q.front()); q.pop_front();
-            lk.unlock();
-
-            std::lock_guard<std::mutex> ck(c_mtx);
-            for(auto it=clients.begin(); it!=clients.end(); ){
-                if(!ws_send_text(*it, msg)){ ::close(*it); it=clients.erase(it); }
-                else ++it;
+int main(int argc,char** argv) {
+    int listener=-1;std::vector<Client> clients;
+    try {
+        const int port=argc>1?std::stoi(argv[1]):9001;if(port<0||port>65535)throw std::invalid_argument("invalid port");
+        std::signal(SIGPIPE,SIG_IGN);std::signal(SIGINT,signal_stop);std::signal(SIGTERM,signal_stop);
+        std::mutex events_mutex;std::deque<std::string> events;size_t dropped_events=0;
+        Engine engine(argc>2?std::stoul(argv[2]):4,EngineOptions{argc>3?argv[3]:"",true});
+        engine.set_event_sink([&](const std::string& value){std::lock_guard<std::mutex> lock(events_mutex);if(events.size()==4096){++dropped_events;return;}events.push_back(value);});
+        engine.start();listener=::socket(AF_INET,SOCK_STREAM,0);if(listener<0)throw std::runtime_error("socket failed");
+        int one=1;::setsockopt(listener,SOL_SOCKET,SO_REUSEADDR,&one,sizeof(one));::fcntl(listener,F_SETFL,O_NONBLOCK);
+        sockaddr_in address{};address.sin_family=AF_INET;address.sin_addr.s_addr=htonl(INADDR_LOOPBACK);address.sin_port=htons(static_cast<uint16_t>(port));
+        if(::bind(listener,reinterpret_cast<sockaddr*>(&address),sizeof(address))<0||::listen(listener,64)<0)throw std::runtime_error("bind/listen failed");
+        socklen_t size=sizeof(address);::getsockname(listener,reinterpret_cast<sockaddr*>(&address),&size);
+        std::cout<<"WS listening on ws://127.0.0.1:"<<ntohs(address.sin_port)<<"/ws"<<std::endl;
+        while(!stopped) {
+            std::vector<pollfd> descriptors{{listener,POLLIN,0}};
+            for(auto& client:clients)descriptors.push_back({client.fd,static_cast<short>(POLLIN|(client.sent<client.output.size()?POLLOUT:0)),0});
+            const auto count=clients.size();const int polled=::poll(descriptors.data(),descriptors.size(),5);
+            if(polled<0){if(errno==EINTR)continue;throw std::runtime_error("poll failed");}
+            if(descriptors[0].revents&POLLIN) {
+                const int fd=::accept(listener,nullptr,nullptr);
+                if(fd>=0){if(clients.size()>=64)::close(fd);else{::fcntl(fd,F_SETFL,O_NONBLOCK);clients.emplace_back(fd);}}
             }
-        }
-    });
-    broadcaster.detach();
-
-    // accept loop
-    while(true){
-        int fd = ::accept(srv,nullptr,nullptr);
-        if(fd<0){ perror("accept"); continue; }
-
-        // --- read HTTP request (very naive)
-        std::string req; req.resize(4096);
-        ssize_t n = recv(fd, req.data(), req.size(), 0);
-        if(n<=0){ ::close(fd); continue; }
-        req.resize(n);
-        if(req.find("Upgrade: websocket")==std::string::npos || req.find("GET /ws ")==std::string::npos){
-            const char* bad="HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
-            send(fd,bad,strlen(bad),0); ::close(fd); continue;
-        }
-        // find Sec-WebSocket-Key
-        std::string key_hdr="Sec-WebSocket-Key:";
-        auto kpos=req.find(key_hdr);
-        if(kpos==std::string::npos){ ::close(fd); continue; }
-        auto kstart=req.find_first_not_of(" \t", kpos+key_hdr.size());
-        auto kend=req.find("\r\n",kstart);
-        std::string key=req.substr(kstart, kend-kstart);
-        // compute accept = base64( SHA1(key + GUID) )
-        const std::string GUID="258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-        auto sha = SHA1::hash(key+GUID);
-        std::string accept = b64(sha.data(), sha.size());
-        std::string resp = "HTTP/1.1 101 Switching Protocols\r\n"
-                           "Upgrade: websocket\r\n"
-                           "Connection: Upgrade\r\n"
-                           "Sec-WebSocket-Accept: "+accept+"\r\n\r\n";
-        send(fd, resp.data(), resp.size(), 0);
-
-        { std::lock_guard<std::mutex> lk(c_mtx); clients.push_back(fd); }
-
-        // per-client receive loop
-        std::thread([fd,&eng](){
-            while(true){
-                std::string payload = ws_read_text(fd);
-                if(payload.empty()){ ::close(fd); break; }
-                // parse minimal JSON
-                auto type = get_str(payload, "type");
-                if(type=="N"){
-                    auto sym = get_str(payload, "sym");
-                    auto side = get_str(payload, "side");
-                    long long px  = get_num(payload, "px");
-                    long long qty = get_num(payload, "qty");
-                    auto tif_s = get_str(payload, "tif");
-                    Tif tif = (tif_s=="IOC")?Tif::IOC : (tif_s=="FOK")?Tif::FOK : Tif::Day;
-                    eng.submit_new(sym, (side=="B"?Side::Buy:Side::Sell), px, qty, tif);
-                } else if(type=="C"){
-                    uint64_t id = (uint64_t)get_num(payload, "id");
-                    eng.submit_cancel(id);
-                } else if(type=="P"){
-                    auto sym = get_str(payload, "sym");
-                    eng.submit_print(sym);
-                } else {
-                    // ignore
+            for(size_t i=0;i<count;i++) {
+                auto& client=clients[i];const auto flags=descriptors[i+1].revents;
+                if(flags&(POLLERR|POLLHUP|POLLNVAL)){client.dead=true;continue;}
+                if(flags&POLLIN) {
+                    char buffer[4096];const auto n=::recv(client.fd,buffer,sizeof(buffer),0);
+                    if(n==0 || (n<0&&errno!=EAGAIN&&errno!=EWOULDBLOCK&&errno!=EINTR))client.dead=true;
+                    if(n>0)client.input.append(buffer,static_cast<size_t>(n));
+                }
+                try {
+                    if(client.input.size()>8192)throw std::runtime_error("receive buffer exceeded");
+                    if(!client.handshake) {
+                        if(std::chrono::steady_clock::now()-client.connected>std::chrono::seconds(2))throw std::runtime_error("handshake timeout");
+                        upgrade(client);
+                    }
+                    if(client.handshake) {
+                        while(auto frame=websocket::parse(client.input)) {
+                            if(frame->opcode==8){client.dead=true;break;}
+                            if(frame->opcode==9)queue(client,frame->payload,10);
+                            else if(frame->opcode==1)command(client,engine,frame->payload);
+                        }
+                        completions(client);
+                    }
+                }catch(const std::exception&){client.dead=true;}
+                if(!client.dead && client.sent<client.output.size()) {
+                    const auto n=::send(client.fd,client.output.data()+client.sent,client.output.size()-client.sent,0);
+                    if(n>0)client.sent+=static_cast<size_t>(n);
+                    else if(n<0&&errno!=EAGAIN&&errno!=EWOULDBLOCK&&errno!=EINTR)client.dead=true;
+                    if(client.sent==client.output.size()){client.output.clear();client.sent=0;}
                 }
             }
-        }).detach();
-    }
-
-    eng.stop();
-    return 0;
+            std::deque<std::string> batch;{std::lock_guard<std::mutex> lock(events_mutex);batch.swap(events);}
+            for(const auto& event:batch)for(auto& client:clients)if(client.handshake&&!client.dead)queue(client,event);
+            for(auto it=clients.begin();it!=clients.end();) {if(it->dead){::close(it->fd);it=clients.erase(it);}else ++it;}
+        }
+        engine.stop();std::cout<<"dropped_trade_events="<<dropped_events<<'\n';
+    }catch(const std::exception& error){std::cerr<<error.what()<<'\n';if(listener>=0)::close(listener);for(auto& client:clients)::close(client.fd);return 1;}
+    if(listener>=0)::close(listener);for(auto& client:clients)::close(client.fd);
 }

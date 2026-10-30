@@ -32,6 +32,8 @@ void recovery() {
     }
     {Engine again(2,{dir.path.string(),false});again.start();CHECK(again.snapshot("AAA").get().asks[0].qty==3);again.stop();}
     must_fail([&]{Engine wrong(3,{dir.path.string(),true});wrong.start();});
+    fs::remove(dir.path/"shard1.wal");
+    must_fail([&]{Engine partial(2,{dir.path.string(),true});partial.start();});
 }
 void malformed_logs() {
     TempDir dir;const auto original=dir.path/"good.wal";
