@@ -48,6 +48,10 @@ struct Client {
     std::deque<Pending> pending;
     std::chrono::steady_clock::time_point connected = std::chrono::steady_clock::now();
     explicit Client(int socket) : fd(socket) {}
+    Client(const Client &) = delete;
+    Client &operator=(const Client &) = delete;
+    Client(Client &&) = default;
+    Client &operator=(Client &&) = default;
 };
 void queue(Client &client, const std::string &payload, uint8_t opcode = 1) {
     if (client.output.size() - client.sent + payload.size() > 262144) {
