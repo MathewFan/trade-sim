@@ -5,3 +5,7 @@ wal_shard*.bin
 *.lock
 .DS_Store
 /benchmark-results.json
+/engine_mvp
+/sharded
+/wal_verify
+/ws_tradesim

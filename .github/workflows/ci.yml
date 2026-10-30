@@ -1,0 +1,31 @@
+name: C++ correctness and recovery
+on: [push, pull_request]
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            sanitizer: ON
+          - os: macos-latest
+            sanitizer: OFF
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DTRADESIM_ASAN=${{ matrix.sanitizer }}
+      - run: cmake --build build --parallel 4
+      - name: Matching, recovery, protocol, and benchmark smoke tests
+        run: ctest --test-dir build --output-on-failure
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: halt_on_error=1
+  thread-safety:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DTRADESIM_TSAN=ON -DCMAKE_CXX_COMPILER=clang++
+      - run: cmake --build build --parallel 4
+      - name: Concurrent ingress and matching under ThreadSanitizer
+        run: ctest --test-dir build --output-on-failure -R core_invariants

@@ -83,7 +83,7 @@ def main():
             clients.append(client)
             client.send({"type": "N", "sym": "AAA", "side": "S", "px": 100, "qty": 10}, split=True)
             first = client.event("ack")
-            assert first["resting"] and first["remaining"] == 10
+            assert first["resting"] and first["remaining"] == 10 and first["durability"] == "fsync"
             client.send({"type": "N", "sym": "BBB", "side": "B", "px": 200, "qty": 4})
             assert client.event("ack")["resting"]
             client.send(b'{"type":"C","id":-1}')

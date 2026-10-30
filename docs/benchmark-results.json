@@ -1,0 +1,263 @@
+{
+  "recorded_at": "2026-10-30T15:32:13.070958+00:00",
+  "platform": "macOS-26.6.2-arm64-arm-64bit",
+  "source_sha256": "91ece10bc9eb64bb6539e984447a83e55c6b2a5ec7d5b22da99ae474752de484",
+  "scope": "Synthetic in-process closed-loop benchmark; integer unit orders across 64 symbols, 64 outstanding per producer; no network, observer callbacks, replication, or production traffic.",
+  "summaries": [
+    {
+      "mode": "memory",
+      "shards": 1,
+      "producers": 1,
+      "commands_per_trial": 999936,
+      "median_commands_per_second": 2422657.17,
+      "min_commands_per_second": 2089750.24,
+      "max_commands_per_second": 2577752.29,
+      "median_p99_observed_completion_us": 28.084
+    },
+    {
+      "mode": "memory",
+      "shards": 1,
+      "producers": 4,
+      "commands_per_trial": 999936,
+      "median_commands_per_second": 1051228.32,
+      "min_commands_per_second": 842427.091,
+      "max_commands_per_second": 1153165.07,
+      "median_p99_observed_completion_us": 446.541
+    },
+    {
+      "mode": "memory",
+      "shards": 4,
+      "producers": 4,
+      "commands_per_trial": 999936,
+      "median_commands_per_second": 1184639.81,
+      "min_commands_per_second": 1030765.64,
+      "max_commands_per_second": 1196003.48,
+      "median_p99_observed_completion_us": 282.292
+    },
+    {
+      "mode": "wal-fsync",
+      "shards": 1,
+      "producers": 1,
+      "commands_per_trial": 1024,
+      "median_commands_per_second": 45504.4533,
+      "min_commands_per_second": 38926.8506,
+      "max_commands_per_second": 48930.6386,
+      "median_p99_observed_completion_us": 1817.833
+    }
+  ],
+  "trials": [
+    {
+      "compiler": "Apple LLVM 21.0.0 (clang-2100.1.1.101)",
+      "hardware_threads": 10,
+      "seed": 42,
+      "latency_scope": "submit to observed completion; 64 outstanding per producer, includes head-of-line observation delay",
+      "scenarios": [
+        {
+          "mode": "memory",
+          "shards": 1,
+          "producers": 1,
+          "commands": 999936,
+          "trades": 499968,
+          "seconds": 0.387910042,
+          "commands_per_second": 2577752.29,
+          "observed_completion_us": {
+            "p50": 12.666,
+            "p95": 20.291,
+            "p99": 21.584
+          }
+        },
+        {
+          "mode": "memory",
+          "shards": 1,
+          "producers": 4,
+          "commands": 999936,
+          "trades": 499968,
+          "seconds": 0.95120725,
+          "commands_per_second": 1051228.32,
+          "observed_completion_us": {
+            "p50": 102.208,
+            "p95": 327.833,
+            "p99": 446.541
+          }
+        },
+        {
+          "mode": "memory",
+          "shards": 4,
+          "producers": 4,
+          "commands": 999936,
+          "trades": 499968,
+          "seconds": 0.836064459,
+          "commands_per_second": 1196003.48,
+          "observed_completion_us": {
+            "p50": 85.625,
+            "p95": 221.75,
+            "p99": 279.916
+          }
+        },
+        {
+          "mode": "wal-fsync",
+          "shards": 1,
+          "producers": 1,
+          "commands": 1024,
+          "trades": 512,
+          "seconds": 0.022503292,
+          "commands_per_second": 45504.4533,
+          "observed_completion_us": {
+            "p50": 695.834,
+            "p95": 1510.292,
+            "p99": 1817.833
+          }
+        }
+      ],
+      "wal_recovery_ms": 1.354917,
+      "same_level_cancel": {
+        "orders": 999936,
+        "seconds": 0.351118667,
+        "cancels_per_second": 2847857.7
+      },
+      "verified": true
+    },
+    {
+      "compiler": "Apple LLVM 21.0.0 (clang-2100.1.1.101)",
+      "hardware_threads": 10,
+      "seed": 42,
+      "latency_scope": "submit to observed completion; 64 outstanding per producer, includes head-of-line observation delay",
+      "scenarios": [
+        {
+          "mode": "memory",
+          "shards": 1,
+          "producers": 1,
+          "commands": 999936,
+          "trades": 499968,
+          "seconds": 0.4127435,
+          "commands_per_second": 2422657.17,
+          "observed_completion_us": {
+            "p50": 13.042,
+            "p95": 21.208,
+            "p99": 28.084
+          }
+        },
+        {
+          "mode": "memory",
+          "shards": 1,
+          "producers": 4,
+          "commands": 999936,
+          "trades": 499968,
+          "seconds": 1.18697038,
+          "commands_per_second": 842427.091,
+          "observed_completion_us": {
+            "p50": 99.042,
+            "p95": 401.625,
+            "p99": 560.875
+          }
+        },
+        {
+          "mode": "memory",
+          "shards": 4,
+          "producers": 4,
+          "commands": 999936,
+          "trades": 499968,
+          "seconds": 0.970090541,
+          "commands_per_second": 1030765.64,
+          "observed_completion_us": {
+            "p50": 106.167,
+            "p95": 262.292,
+            "p99": 327.959
+          }
+        },
+        {
+          "mode": "wal-fsync",
+          "shards": 1,
+          "producers": 1,
+          "commands": 1024,
+          "trades": 512,
+          "seconds": 0.020927583,
+          "commands_per_second": 48930.6386,
+          "observed_completion_us": {
+            "p50": 642.541,
+            "p95": 1328.458,
+            "p99": 1574.208
+          }
+        }
+      ],
+      "wal_recovery_ms": 1.412167,
+      "same_level_cancel": {
+        "orders": 999936,
+        "seconds": 0.397141375,
+        "cancels_per_second": 2517833.86
+      },
+      "verified": true
+    },
+    {
+      "compiler": "Apple LLVM 21.0.0 (clang-2100.1.1.101)",
+      "hardware_threads": 10,
+      "seed": 42,
+      "latency_scope": "submit to observed completion; 64 outstanding per producer, includes head-of-line observation delay",
+      "scenarios": [
+        {
+          "mode": "memory",
+          "shards": 1,
+          "producers": 1,
+          "commands": 999936,
+          "trades": 499968,
+          "seconds": 0.478495459,
+          "commands_per_second": 2089750.24,
+          "observed_completion_us": {
+            "p50": 15.333,
+            "p95": 24.875,
+            "p99": 29.917
+          }
+        },
+        {
+          "mode": "memory",
+          "shards": 1,
+          "producers": 4,
+          "commands": 999936,
+          "trades": 499968,
+          "seconds": 0.867123041,
+          "commands_per_second": 1153165.07,
+          "observed_completion_us": {
+            "p50": 106.042,
+            "p95": 313.375,
+            "p99": 435.416
+          }
+        },
+        {
+          "mode": "memory",
+          "shards": 4,
+          "producers": 4,
+          "commands": 999936,
+          "trades": 499968,
+          "seconds": 0.844084417,
+          "commands_per_second": 1184639.81,
+          "observed_completion_us": {
+            "p50": 87.791,
+            "p95": 223.5,
+            "p99": 282.292
+          }
+        },
+        {
+          "mode": "wal-fsync",
+          "shards": 1,
+          "producers": 1,
+          "commands": 1024,
+          "trades": 512,
+          "seconds": 0.02630575,
+          "commands_per_second": 38926.8506,
+          "observed_completion_us": {
+            "p50": 821.334,
+            "p95": 1595.542,
+            "p99": 2609.583
+          }
+        }
+      ],
+      "wal_recovery_ms": 1.39675,
+      "same_level_cancel": {
+        "orders": 999936,
+        "seconds": 0.300594041,
+        "cancels_per_second": 3326533.01
+      },
+      "verified": true
+    }
+  ]
+}

@@ -47,3 +47,8 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME websocket_loopback COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/websocket_integration.py $<TARGET_FILE:ws_server>)
   set_tests_properties(websocket_loopback PROPERTIES TIMEOUT 30)
 endif()
+
+add_executable(benchmark apps/benchmark.cpp)
+target_link_libraries(benchmark PRIVATE tradesim)
+add_test(NAME benchmark_smoke COMMAND benchmark 1024)
+set_tests_properties(benchmark_smoke PROPERTIES TIMEOUT 30)
