@@ -1,4 +1,13 @@
-#include <bits/stdc++.h>
+#include <algorithm>
+#include <array>
+#include <condition_variable>
+#include <cstring>
+#include <deque>
+#include <iostream>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>

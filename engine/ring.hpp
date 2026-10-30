@@ -2,11 +2,12 @@
 #include <atomic>
 #include <cstddef>
 #include <type_traits>
+#include <utility>
 
 // Single-Producer/Single-Consumer ring buffer (fixed size; N must be a power of two)
 template<typename T, size_t N>
 struct SpscRing {
-    static_assert((N & (N-1)) == 0, "N must be power of two");
+    static_assert(N >= 2 && (N & (N-1)) == 0, "N must be power of two");
     alignas(64) std::atomic<size_t> head{0};
     alignas(64) std::atomic<size_t> tail{0};
     T buf[N];
@@ -22,7 +23,8 @@ struct SpscRing {
     bool pop(T& out) {
         size_t t = tail.load(std::memory_order_relaxed);
         if (t == head.load(std::memory_order_acquire)) return false; // empty
-        out = buf[t];
+        out = std::move(buf[t]);
+        buf[t] = T{};
         tail.store((t + 1) & (N - 1), std::memory_order_release);
         return true;
     }

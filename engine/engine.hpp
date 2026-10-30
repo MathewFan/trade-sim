@@ -1,79 +1,78 @@
 #pragma once
 #include <atomic>
-#include <thread>
-#include <vector>
+#include <chrono>
+#include <functional>
+#include <future>
 #include <memory>
 #include <mutex>
-#include <string>
-#include <cstdint>
-#include <array>
-#include <functional>
+#include <shared_mutex>
+#include <thread>
 #include "ring.hpp"
-#include "book.hpp"
 #include "match.hpp"
+#include "wal.hpp"
 
-enum class MsgType : uint8_t { New=0, Cancel=1, Print=2, Stop=3 };
-
+struct DepthLevel { long long px,qty; size_t orders; };
+struct Snapshot {
+    std::string sym; uint64_t sequence{}; size_t active_orders{};
+    std::vector<DepthLevel> bids,asks;
+    std::string canonical, state_hash, journal_tip;
+};
+struct ExecutionReport {
+    uint64_t id{},sequence{};
+    std::vector<Trade> trades;
+    long long remaining{};
+    bool resting{},cancelled{};
+};
+struct Ticket { uint64_t id; std::future<ExecutionReport> completion; };
+enum class MsgType : uint8_t { New,Cancel,Print,Snapshot,Barrier };
 struct Msg {
-    MsgType type{MsgType::New};
-    Order order{};             // valid if type==New
-    uint64_t cancel_id{0};     // valid if type==Cancel
-    std::string print_sym;     // valid if type==Print
+    MsgType type{MsgType::New}; Order order{}; uint64_t cancel_id{}; std::string print_sym;
+    std::shared_ptr<std::promise<ExecutionReport>> report;
+    std::shared_ptr<std::promise<::Snapshot>> snapshot;
+    std::shared_ptr<std::promise<void>> barrier;
 };
-
-class WalWriter; // fwd-declare
-
 struct ShardWorker {
-    using Ring = SpscRing<Msg, 1 << 16>;
-    Ring ring;
-    std::thread th;
+    SpscRing<Msg,4096> ring;
+    std::timed_mutex producer_mutex;
+    std::thread thread;
     std::atomic<bool> running{false};
-    std::vector<std::unique_ptr<Order>> arena;
-    Book book;
-    std::atomic<long long> seq{0};
+    std::map<std::string,Book> books;
+    std::unordered_map<uint64_t,std::string> active_symbols;
+    uint64_t sequence{};
     std::unique_ptr<WalWriter> wal;
-    std::array<uint8_t,32> state_root{};
+    std::array<uint8_t,32> journal_tip{};
 };
-
-struct Engine {
-    explicit Engine(size_t n_shards);
+struct EngineOptions { std::string wal_directory; bool sync_wal{true}; };
+class Engine {
+public:
+    explicit Engine(size_t shards,EngineOptions options={});
     ~Engine();
-
-    void start();
-    void stop();
-
-    // API
-    uint64_t submit_new(const std::string& sym, Side side, long long px, long long qty, Tif tif);
-    void     submit_cancel(uint64_t id);
-    void     submit_print(const std::string& sym);
-
-    // Event sink (optional): called on trades and on state-root prints
-    void set_event_sink(std::function<void(const std::string&)> cb){ on_event = std::move(cb); }
-
+    void start(); void stop(); void flush();
+    Ticket submit(const std::string& sym,Side side,long long px,long long qty,Tif tif);
+    uint64_t submit_new(const std::string& sym,Side side,long long px,long long qty,Tif tif) {return submit(sym,side,px,qty,tif).id;}
+    std::future<ExecutionReport> cancel_async(uint64_t id);
+    void submit_cancel(uint64_t id) {(void)cancel_async(id);}
+    void submit_print(const std::string& sym);
+    std::future<Snapshot> snapshot(const std::string& sym);
+    void set_event_sink(std::function<void(const std::string&)> sink);
+    static uint64_t symbol_hash(const std::string& sym) {
+        uint64_t value=14695981039346656037ULL;
+        for(unsigned char byte:sym) {value^=byte;value*=1099511628211ULL;} return value;
+    }
 private:
-    size_t nshards;
+    size_t nshards; EngineOptions options;
     std::vector<std::unique_ptr<ShardWorker>> shards;
     std::atomic<uint64_t> next_id{1};
-    std::mutex print_mtx; // for stdout serialization
-    std::function<void(const std::string&)> on_event; // JSON lines to broadcast
-
-    size_t shard_of(const std::string& sym) const {
-        return std::hash<std::string>{}(sym) % nshards;
-    }
-
-    // --- serialization for WAL "raw_msg" ---
-    static std::vector<uint8_t> ser_new(const Order& o){
-        std::string s = "N " + o.sym + " " + (o.side==Side::Buy?"B":"S") + " " +
-                        std::to_string(o.px) + " " + std::to_string(o.qty) + " " +
-                        (o.tif==Tif::IOC?"IOC":(o.tif==Tif::FOK?"FOK":"DAY"));
-        return std::vector<uint8_t>(s.begin(), s.end());
-    }
-    static std::vector<uint8_t> ser_cancel(uint64_t id){
-        std::string s = "C " + std::to_string(id);
-        return std::vector<uint8_t>(s.begin(), s.end());
-    }
-    static std::vector<uint8_t> ser_print(const std::string& sym){
-        std::string s = "P " + sym;
-        return std::vector<uint8_t>(s.begin(), s.end());
-    }
+    std::shared_mutex lifecycle;
+    bool started{},accepting{};
+    std::mutex failure_mutex,sink_mutex;
+    std::exception_ptr failure;
+    std::function<void(const std::string&)> on_event;
+    void enqueue(size_t shard,Msg message);
+    void worker(ShardWorker& shard);
+    void apply(ShardWorker& shard,Msg& message,bool recovering=false);
+    void check_failure();
+    void emit(const std::string& event);
+    Snapshot make_snapshot(const ShardWorker& shard,const std::string& sym) const;
+    size_t shard_of(const std::string& sym) const {return symbol_hash(sym)%nshards;}
 };

@@ -1,6 +1,7 @@
-build/
-*.o
-*.exe
-*.bin
-*.out
-*.log
+/build*/
+/wal/
+wal_shard*.bin
+*.wal
+*.lock
+.DS_Store
+/benchmark-results.json

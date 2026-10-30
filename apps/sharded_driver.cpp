@@ -1,33 +1,23 @@
-#include <bits/stdc++.h>
-#include "../engine/engine.hpp"
-
-int main(int argc, char** argv){
-    std::ios::sync_with_stdio(false);
-    std::cin.tie(nullptr);
-
-    size_t nshards = 4; // tweak as you like: 2, 4, 8...
-    if (argc>=2) nshards = std::max<size_t>(1, std::stoul(argv[1]));
-
-    Engine eng(nshards);
-    eng.start();
-
-    std::string cmd;
-    while (std::cin >> cmd){
-        if (cmd=="N"){
-            std::string sym, side_s, tif_s="DAY"; long long px, qty;
-            std::cin >> sym >> side_s >> px >> qty >> tif_s;
-            Side side = (side_s=="B")? Side::Buy : Side::Sell;
-            Tif  tif  = (tif_s=="IOC")? Tif::IOC : (tif_s=="FOK")? Tif::FOK : Tif::Day;
-            eng.submit_new(sym, side, px, qty, tif);
-        } else if (cmd=="C"){
-            uint64_t id; std::cin >> id;
-            eng.submit_cancel(id);
-        } else if (cmd=="P"){
-            std::string sym; std::cin >> sym;
-            eng.submit_print(sym);
+#include "engine.hpp"
+#include <iostream>
+#include <sstream>
+int main(int argc,char** argv) {
+    try {
+        Engine engine(argc>1?std::stoul(argv[1]):4);engine.set_event_sink([](const std::string& event){std::cout<<event<<'\n';});engine.start();
+        std::string line;
+        while(std::getline(std::cin,line)) {
+            std::istringstream input(line);std::string command;input>>command;
+            try {
+                if(command=="N") {
+                    std::string sym,side,tif;long long px,qty;
+                    if(!(input>>sym>>side>>px>>qty>>tif)||(side!="B"&&side!="S")||(tif!="DAY"&&tif!="IOC"&&tif!="FOK")) throw std::invalid_argument("N SYMBOL B|S PRICE QTY DAY|IOC|FOK");
+                    auto ticket=engine.submit(sym,side=="B"?Side::Buy:Side::Sell,px,qty,tif=="DAY"?Tif::Day:tif=="IOC"?Tif::IOC:Tif::FOK);
+                    auto report=ticket.completion.get();std::cout<<"ACK "<<report.id<<" seq="<<report.sequence<<" remaining="<<report.remaining<<" resting="<<report.resting<<'\n';
+                }else if(command=="C") {uint64_t id;if(!(input>>id)) throw std::invalid_argument("C ID");std::cout<<"CANCEL "<<engine.cancel_async(id).get().cancelled<<'\n';}
+                else if(command=="P") {std::string sym;if(!(input>>sym)) throw std::invalid_argument("P SYMBOL");engine.submit_print(sym);engine.flush();}
+                else if(!command.empty()) throw std::invalid_argument("unknown command");
+            }catch(const std::exception& error){std::cerr<<"ERROR "<<error.what()<<'\n';}
         }
-    }
-
-    eng.stop();
-    return 0;
+        engine.flush();engine.stop();
+    }catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 1;}
 }

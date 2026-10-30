@@ -1,72 +1,84 @@
 #pragma once
 #include "book.hpp"
-#include <vector>
+#include <algorithm>
+#include <limits>
 
-template<typename MapT, typename CrossFn>
-inline void cross_and_fill(Book& b, MapT& contra, Order& in, long long seq, CrossFn cross, std::vector<Trade>& out){
-    for (auto it=contra.begin(); it!=contra.end() && in.qty>0 && cross(it->first); ){
-        auto& lvl = it->second;
-        while(!lvl.q.empty() && in.qty>0){
-            Order* r = lvl.q.front();
-            long long q = std::min(in.qty, r->qty);
-            r->qty -= q; in.qty -= q; lvl.total_qty -= q;
-            out.push_back(Trade{r->id, in.id, it->first, q, seq, in.ts_ns});
-            if (r->qty==0){ b.by_id.erase(r->id.v); lvl.q.pop_front(); }
+template<typename MapT,typename Cross>
+inline void cross_and_fill(Book& book,MapT& contra,Order& incoming,long long seq,Cross cross,std::vector<Trade>& out) {
+    for(auto level=contra.begin();level!=contra.end() && incoming.qty>0 && cross(level->first);) {
+        auto& value=level->second;
+        while(!value.q.empty() && incoming.qty>0) {
+            auto* resting=value.q.front();
+            const auto quantity=std::min(resting->qty,incoming.qty);
+            out.push_back({resting->id,incoming.id,level->first,quantity,seq,incoming.ts_ns});
+            resting->qty-=quantity; incoming.qty-=quantity; value.total_qty-=quantity;
+            if(!resting->qty) {
+                const auto id=resting->id.v; value.q.pop_front();
+                book.positions.erase(id); book.by_id.erase(id);
+            }
         }
-        if (lvl.q.empty()) it = contra.erase(it); else ++it;
+        if(value.q.empty()) level=contra.erase(level); else ++level;
     }
 }
-
-inline std::vector<Trade> match(Book& b, Order& in, long long seq){
-    std::vector<Trade> out;
-    if (in.tif==Tif::FOK){
-        // Dry-run check for total available qty at acceptable prices
-        long long need = in.qty, have = 0;
-        if (in.side==Side::Buy){
-            for (auto& [px, lvl] : b.asks){ if (px>in.px && in.px!=0) break; for (auto* o: lvl.q) have += o->qty; if (have>=need) break; }
-        } else {
-            for (auto& [px, lvl] : b.bids){ if (px<in.px && in.px!=0) break; for (auto* o: lvl.q) have += o->qty; if (have>=need) break; }
-        }
-        if (have < need) return out; // cancel entirely
+inline std::vector<Trade> match(Book& book,Order& incoming,long long seq) {
+    validate_order(incoming);
+    if(book.by_id.count(incoming.id.v)) throw std::invalid_argument("duplicate active order ID");
+    // Keep aggregate quantities representable and active storage explicitly bounded.
+    if(book.by_id.size()>=1000000) throw std::length_error("active-order capacity exceeded");
+    std::vector<Trade> trades;
+    if(incoming.tif==Tif::FOK) {
+        auto need=incoming.qty;
+        auto sufficient=[&](const auto& levels,auto crosses) {
+            for(const auto& [price,level]:levels) {
+                if(!crosses(price)) break;
+                if(level.total_qty>=need) return true;
+                need-=level.total_qty;
+            }
+            return false;
+        };
+        const bool fillable=incoming.side==Side::Buy?
+            sufficient(book.asks,[&](auto px){return incoming.px==0||px<=incoming.px;}):
+            sufficient(book.bids,[&](auto px){return incoming.px==0||px>=incoming.px;});
+        if(!fillable) return trades; // No mutations on failed FOK.
     }
-
-    if (in.side==Side::Buy){
-        auto cross = [&](long long px){ return (px<=in.px || in.px==0); };
-        cross_and_fill(b, b.asks, in, seq, cross, out);
-    } else {
-        auto cross = [&](long long px){ return (px>=in.px || in.px==0); };
-        cross_and_fill(b, b.bids, in, seq, cross, out);
-    }
-
-    // Place residual if not IOC/FOK and it's a limit
-    if (in.qty>0 && in.tif==Tif::Day && in.px>0) add_to_book(b,&in);
-    return out;
+    if(incoming.side==Side::Buy)
+        cross_and_fill(book,book.asks,incoming,seq,[&](auto px){return incoming.px==0||px<=incoming.px;},trades);
+    else cross_and_fill(book,book.bids,incoming,seq,[&](auto px){return incoming.px==0||px>=incoming.px;},trades);
+    if(incoming.qty>0 && incoming.tif==Tif::Day && incoming.px>0) add_to_book(book,&incoming);
+    return trades;
 }
-
-// Cancel by ID (returns true if removed)
-inline bool cancel(Book& b, uint64_t id){
-    auto it = b.by_id.find(id);
-    if (it==b.by_id.end()) return false;
-    Order* o = it->second;
-    if (o->side==Side::Buy){
-        auto lit = b.bids.find(o->px);
-        if (lit!=b.bids.end()){
-            auto& q = lit->second.q;
-            for (auto qi=q.begin(); qi!=q.end(); ++qi){
-                if ((*qi)->id.v==id){ lit->second.total_qty -= (*qi)->qty; q.erase(qi); break; }
+inline bool cancel(Book& book,uint64_t id) {
+    auto found=book.by_id.find(id);
+    if(found==book.by_id.end()) return false;
+    const auto* order=found->second.get();
+    auto remove=[&](auto& levels) {
+        auto level=levels.find(order->px);
+        level->second.total_qty-=order->qty;
+        level->second.q.erase(book.positions.at(id));
+        if(level->second.q.empty()) levels.erase(level);
+    };
+    if(order->side==Side::Buy) remove(book.bids); else remove(book.asks);
+    book.positions.erase(id); book.by_id.erase(found); return true;
+}
+inline bool valid_book(const Book& book) {
+    size_t count=0;
+    auto check=[&](const auto& levels,Side side) {
+        for(const auto& [price,level]:levels) {
+            if(level.q.empty()) return false;
+            long long total=0;
+            for(auto iter=level.q.begin();iter!=level.q.end();++iter) {
+                const auto* order=*iter;
+                const auto found=book.by_id.find(order->id.v);
+                const auto position=book.positions.find(order->id.v);
+                if(order->qty<=0 || order->px!=price || order->side!=side || found==book.by_id.end() ||
+                   found->second.get()!=order || position==book.positions.end() || *position->second!=order) return false;
+                total+=order->qty; ++count;
             }
-            if (lit->second.q.empty()) b.bids.erase(lit);
+            if(total!=level.total_qty) return false;
         }
-    } else {
-        auto lit = b.asks.find(o->px);
-        if (lit!=b.asks.end()){
-            auto& q = lit->second.q;
-            for (auto qi=q.begin(); qi!=q.end(); ++qi){
-                if ((*qi)->id.v==id){ lit->second.total_qty -= (*qi)->qty; q.erase(qi); break; }
-            }
-            if (lit->second.q.empty()) b.asks.erase(lit);
-        }
-    }
-    b.by_id.erase(it);
-    return true;
+        return true;
+    };
+    return check(book.bids,Side::Buy) && check(book.asks,Side::Sell) &&
+        count==book.by_id.size() && count==book.positions.size() &&
+        (book.bids.empty() || book.asks.empty() || book.bids.begin()->first<book.asks.begin()->first);
 }
