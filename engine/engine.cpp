@@ -120,9 +120,15 @@ void Engine::enqueue(size_t index, Msg msg) {
     auto &shard = *shards[index];
     // Serializing producers preserves the ring's single-producer contract.
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
-    std::unique_lock<std::timed_mutex> producer(shard.producer_mutex, std::defer_lock);
-    if (!producer.try_lock_until(deadline))
-        throw std::runtime_error("shard producer admission timed out");
+    std::unique_lock<std::mutex> producer(shard.producer_mutex, std::defer_lock);
+    // Use try_lock rather than platform-specific timed-mutex clock entry points;
+    // older Linux sanitizer runtimes can observe every acquisition correctly.
+    while (!producer.try_lock()) {
+        check_failure();
+        if (std::chrono::steady_clock::now() >= deadline)
+            throw std::runtime_error("shard producer admission timed out");
+        std::this_thread::yield();
+    }
     while (!shard.ring.push(msg)) {
         check_failure();
         if (std::chrono::steady_clock::now() >= deadline)

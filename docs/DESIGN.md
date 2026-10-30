@@ -8,7 +8,7 @@ FNV-1a routing is specified in code rather than depending on implementation-defi
 
 ## Define the arrival order and ownership boundary
 
-Concurrent producers are serialized before publishing into each acquire/release SPSC ring. A timed producer mutex plus bounded queue wait produces explicit overload errors. The worker never contends for that producer mutex. Admission order—not wall-clock timestamp or globally allocated ID—is FIFO arrival order. Cross-shard execution has no global total order.
+Concurrent producers are serialized before publishing into each acquire/release SPSC ring. A producer mutex with an explicit deadline plus bounded queue wait produces explicit overload errors. The worker never contends for that producer mutex. Admission order—not wall-clock timestamp or globally allocated ID—is FIFO arrival order. Cross-shard execution has no global total order.
 
 The old raw-pointer arena retained every submitted order. Books now own only active orders; lists hold stable pointers, and an ID-to-iterator index gives constant-time FIFO unlink. Cancellation still includes a price-map lookup, so its total complexity is expected hash lookup plus O(log price levels), not universally O(1). Allocations are still present: this is not a preallocated or allocation-free engine.
 
@@ -18,7 +18,7 @@ DAY limit residuals rest; market residuals do not. IOC drops unfilled quantity. 
 
 `submit_new` returns an admission ID. `submit` returns an ID plus a completion future. A successful completion means the command has been applied; in WAL sync mode its immutable command was written and fsynced first. The WebSocket ACK uses the completion future, not queue admission. Memory-mode ACKs explicitly identify that mode.
 
-A file write failure may leave a partial final frame. The engine fails later commands and exposes failures through completion futures/barriers; it does not guess whether to continue. Recovery verifies the log and rejects partial tails. Operators must preserve the original log and use a trusted checkpoint/explicit repair policy rather than silently discarding bytes. Book allocation failure after a successful journal append similarly leaves an uncertain acknowledgment; replay is authoritative for that input prefix.
+Existing zero-byte files are rejected rather than silently initialized: they may be evidence of truncation or interruption during initial creation. New-file detection uses exclusive creation. A file write failure may leave a partial final frame. The engine fails later commands and exposes failures through completion futures/barriers; it does not guess whether to continue. Recovery verifies the log and rejects partial tails. Operators must preserve the original log and use a trusted checkpoint/explicit repair policy rather than silently discarding bytes. Book allocation failure after a successful journal append similarly leaves an uncertain acknowledgment; replay is authoritative for that input prefix.
 
 The observer callback is isolated from matching exceptions, but still runs on a worker. A blocking observer can stall that shard. The server's callback only pushes into a bounded bridge. Trade broadcasts are a best-effort presentation feed, not the durable event source. Completion acknowledgments and resynchronization semantics remain separate. There is no exactly-once client retry guarantee.
 

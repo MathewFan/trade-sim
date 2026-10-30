@@ -194,7 +194,10 @@ class WalWriter {
     uint64_t sequence{};
     WalWriter(const std::string &file, uint32_t count, uint32_t index, bool durable)
         : sync(durable), path(file) {
-        fd = ::open(path.c_str(), O_RDWR | O_CREAT, 0600);
+        fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_EXCL, 0600);
+        const bool created = fd >= 0;
+        if (fd < 0 && errno == EEXIST)
+            fd = ::open(path.c_str(), O_RDWR);
         if (fd < 0)
             throw std::runtime_error("cannot create/open WAL " + path);
         try {
@@ -203,7 +206,10 @@ class WalWriter {
             struct stat info{};
             if (::fstat(fd, &info) != 0)
                 throw std::runtime_error("cannot stat WAL");
-            if (info.st_size == 0) {
+            if (info.st_size == 0 && !created)
+                throw std::runtime_error(
+                    "existing empty WAL: refusing to erase possible truncation evidence");
+            if (created) {
                 const auto head = wal_codec::header(count, index);
                 write_all(head);
                 synchronize();

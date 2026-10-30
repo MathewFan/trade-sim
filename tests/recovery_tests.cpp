@@ -108,6 +108,9 @@ void malformed_logs() {
     const auto bytes = read(original);
     CHECK(scan_wal(original.string()).records == 1);
     const auto bad = dir.path / "bad.wal";
+    write(bad, {});
+    must_fail([&] { WalWriter existing_empty(bad.string(), 1, 0, true); });
+    CHECK(fs::file_size(bad) == 0);
     for (size_t end = 0; end < bytes.size(); end++) {
         // A complete header is a valid empty prefix. Detecting deletion of whole
         // trailing records requires an externally trusted expected tip.

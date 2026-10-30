@@ -44,7 +44,7 @@ struct Msg {
 };
 struct ShardWorker {
     SpscRing<Msg, 4096> ring;
-    std::timed_mutex producer_mutex;
+    std::mutex producer_mutex;
     std::thread thread;
     std::atomic<bool> running{false};
     std::map<std::string, Book> books;
